@@ -61,7 +61,7 @@ vi.mock("@xterm/xterm", () => ({
 		open(host: HTMLElement) {
 			host.appendChild(document.createElement("textarea"));
 		}
-		write = vi.fn();
+		write = vi.fn((_data: string | Uint8Array, callback?: () => void) => callback?.());
 		writeln() {}
 		dispose() {}
 		onData(listener: (data: string) => void) {
@@ -650,7 +650,7 @@ describe("XtermTerminal", () => {
 	});
 
 	describe("right-click context menu", () => {
-		it("copies the current selection and clears the terminal via the Cut menu item", async () => {
+		it("copies the current selection and clears only the current line via the Cut menu item", async () => {
 			const { container } = render(<XtermTerminal theme="dark" />);
 			state.lastTerminal!.selection = "menu cut selection";
 
@@ -658,7 +658,11 @@ describe("XtermTerminal", () => {
 			await userEvent.click(await screen.findByText("Cut"));
 
 			expect(window.ao!.clipboard.writeText).toHaveBeenCalledWith("menu cut selection");
-			expect(state.lastTerminal!.write).toHaveBeenCalledWith("\x1b[3J\x1b[2J\x1b[H");
+			// Cut targets the in-progress input line only (2K + \r) — it must never
+			// send the whole-pane CLEAR_SEQUENCE (3J/2J), which would also wipe
+			// scrollback and everything else already printed.
+			expect(state.lastTerminal!.write).toHaveBeenCalledWith("\x1b[2K\r");
+			expect(state.lastTerminal!.write).not.toHaveBeenCalledWith("\x1b[3J\x1b[2J\x1b[H", expect.any(Function));
 		});
 
 		it("disables Cut when nothing is selected", async () => {
@@ -722,7 +726,7 @@ describe("XtermTerminal", () => {
 			fireEvent.contextMenu(container.firstElementChild!);
 			await userEvent.click(await screen.findByText("Clear"));
 
-			expect(state.lastTerminal!.write).toHaveBeenCalledWith("\x1b[3J\x1b[2J\x1b[H");
+			expect(state.lastTerminal!.write).toHaveBeenCalledWith("\x1b[3J\x1b[2J\x1b[H", expect.any(Function));
 		});
 
 		it("scrolls to the bottom after Clear, so a scrolled-up viewport isn't stranded past the erased buffer", async () => {
@@ -734,12 +738,24 @@ describe("XtermTerminal", () => {
 			expect(state.lastTerminal!.scrollToBottom).toHaveBeenCalled();
 		});
 
-		it("scrolls to the bottom after Cut, for the same reason as Clear", async () => {
+		it("does not scroll or touch scrollback when cutting, since only the current line is erased", async () => {
 			const { container } = render(<XtermTerminal theme="dark" />);
 			state.lastTerminal!.selection = "menu cut selection";
 
 			fireEvent.contextMenu(container.firstElementChild!);
 			await userEvent.click(await screen.findByText("Cut"));
+
+			expect(state.lastTerminal!.scrollToBottom).not.toHaveBeenCalled();
+		});
+
+		it("does not throw when scrollToBottom hits the renderer-not-ready race after Clear", async () => {
+			const { container } = render(<XtermTerminal theme="dark" />);
+			state.lastTerminal!.scrollToBottom.mockImplementationOnce(() => {
+				throw new TypeError("Cannot read properties of undefined (reading 'dimensions')");
+			});
+
+			fireEvent.contextMenu(container.firstElementChild!);
+			await expect(userEvent.click(await screen.findByText("Clear"))).resolves.not.toThrow();
 
 			expect(state.lastTerminal!.scrollToBottom).toHaveBeenCalled();
 		});
