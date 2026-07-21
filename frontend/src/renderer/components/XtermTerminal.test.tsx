@@ -1,4 +1,5 @@
-import { render } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { XtermTerminal } from "./XtermTerminal";
 
@@ -12,9 +13,12 @@ const state = vi.hoisted(() => ({
 		modes: { bracketedPasteMode: boolean; mouseTrackingMode: string };
 		buffer: { active: { type: string } };
 		scrollLines: ReturnType<typeof vi.fn>;
+		scrollToBottom: ReturnType<typeof vi.fn>;
 		dataListeners: Set<(data: string) => void>;
 		keyListeners: Set<(event: { key: string }) => void>;
 		selectionListeners: Set<() => void>;
+		selectAll: ReturnType<typeof vi.fn>;
+		write: ReturnType<typeof vi.fn>;
 		_core: {
 			element: { classList: { add: ReturnType<typeof vi.fn>; remove: ReturnType<typeof vi.fn> } };
 			_selectionService: {
@@ -36,6 +40,7 @@ vi.mock("@xterm/xterm", () => ({
 		modes = { bracketedPasteMode: false, mouseTrackingMode: "vt200" };
 		buffer = { active: { type: "normal" } };
 		scrollLines = vi.fn();
+		scrollToBottom = vi.fn();
 		dataListeners = new Set<(data: string) => void>();
 		keyListeners = new Set<(event: { key: string }) => void>();
 		selectionListeners = new Set<() => void>();
@@ -56,7 +61,7 @@ vi.mock("@xterm/xterm", () => ({
 		open(host: HTMLElement) {
 			host.appendChild(document.createElement("textarea"));
 		}
-		write() {}
+		write = vi.fn();
 		writeln() {}
 		dispose() {}
 		onData(listener: (data: string) => void) {
@@ -83,6 +88,7 @@ vi.mock("@xterm/xterm", () => ({
 		getSelection() {
 			return this.selection;
 		}
+		selectAll = vi.fn();
 		attachCustomKeyEventHandler(listener: (event: KeyboardEvent) => boolean) {
 			this.keyHandler = listener;
 		}
@@ -641,5 +647,101 @@ describe("XtermTerminal", () => {
 		expect(state.lastTerminal!._core._selectionService.enable).toHaveBeenCalled();
 		expect(state.lastTerminal!._core.element.classList.remove).toHaveBeenCalledWith("enable-mouse-events");
 		expect(state.lastTerminal!._core._selectionService.shouldForceSelection({} as MouseEvent)).toBe(true);
+	});
+
+	describe("right-click context menu", () => {
+		it("copies the current selection and clears the terminal via the Cut menu item", async () => {
+			const { container } = render(<XtermTerminal theme="dark" />);
+			state.lastTerminal!.selection = "menu cut selection";
+
+			fireEvent.contextMenu(container.firstElementChild!);
+			await userEvent.click(await screen.findByText("Cut"));
+
+			expect(window.ao!.clipboard.writeText).toHaveBeenCalledWith("menu cut selection");
+			expect(state.lastTerminal!.write).toHaveBeenCalledWith("\x1b[3J\x1b[2J\x1b[H");
+		});
+
+		it("disables Cut when nothing is selected", async () => {
+			const { container } = render(<XtermTerminal theme="dark" />);
+			state.lastTerminal!.selection = "";
+
+			fireEvent.contextMenu(container.firstElementChild!);
+			const cutItem = await screen.findByText("Cut");
+
+			expect(cutItem.closest('[role="menuitem"]')).toHaveAttribute("data-disabled");
+			await userEvent.click(cutItem);
+			expect(window.ao!.clipboard.writeText).not.toHaveBeenCalled();
+			expect(state.lastTerminal!.write).not.toHaveBeenCalled();
+		});
+
+		it("copies the current selection via the Copy menu item", async () => {
+			const { container } = render(<XtermTerminal theme="dark" />);
+			state.lastTerminal!.selection = "menu copied selection";
+
+			fireEvent.contextMenu(container.firstElementChild!);
+			await userEvent.click(await screen.findByText("Copy"));
+
+			expect(window.ao!.clipboard.writeText).toHaveBeenCalledWith("menu copied selection");
+		});
+
+		it("disables Copy when nothing is selected", async () => {
+			const { container } = render(<XtermTerminal theme="dark" />);
+			state.lastTerminal!.selection = "";
+
+			fireEvent.contextMenu(container.firstElementChild!);
+			const copyItem = await screen.findByText("Copy");
+
+			expect(copyItem.closest('[role="menuitem"]')).toHaveAttribute("data-disabled");
+			await userEvent.click(copyItem);
+			expect(window.ao!.clipboard.writeText).not.toHaveBeenCalled();
+		});
+
+		it("pastes clipboard text via the Paste menu item", async () => {
+			const onInput = vi.fn();
+			const { container } = render(<XtermTerminal theme="dark" onReady={(terminal) => terminal.onUserInput(onInput)} />);
+			window.ao!.clipboard.readText = vi.fn().mockResolvedValue("pasted from menu");
+
+			fireEvent.contextMenu(container.firstElementChild!);
+			await userEvent.click(await screen.findByText("Paste"));
+
+			await waitFor(() => expect(onInput).toHaveBeenCalledWith("pasted from menu", "paste"));
+		});
+
+		it("selects the whole buffer via the Select All menu item", async () => {
+			const { container } = render(<XtermTerminal theme="dark" />);
+
+			fireEvent.contextMenu(container.firstElementChild!);
+			await userEvent.click(await screen.findByText("Select All"));
+
+			expect(state.lastTerminal!.selectAll).toHaveBeenCalled();
+		});
+
+		it("clears the screen and scrollback via the Clear menu item", async () => {
+			const { container } = render(<XtermTerminal theme="dark" />);
+
+			fireEvent.contextMenu(container.firstElementChild!);
+			await userEvent.click(await screen.findByText("Clear"));
+
+			expect(state.lastTerminal!.write).toHaveBeenCalledWith("\x1b[3J\x1b[2J\x1b[H");
+		});
+
+		it("scrolls to the bottom after Clear, so a scrolled-up viewport isn't stranded past the erased buffer", async () => {
+			const { container } = render(<XtermTerminal theme="dark" />);
+
+			fireEvent.contextMenu(container.firstElementChild!);
+			await userEvent.click(await screen.findByText("Clear"));
+
+			expect(state.lastTerminal!.scrollToBottom).toHaveBeenCalled();
+		});
+
+		it("scrolls to the bottom after Cut, for the same reason as Clear", async () => {
+			const { container } = render(<XtermTerminal theme="dark" />);
+			state.lastTerminal!.selection = "menu cut selection";
+
+			fireEvent.contextMenu(container.firstElementChild!);
+			await userEvent.click(await screen.findByText("Cut"));
+
+			expect(state.lastTerminal!.scrollToBottom).toHaveBeenCalled();
+		});
 	});
 });
