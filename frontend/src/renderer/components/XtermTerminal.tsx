@@ -85,6 +85,13 @@ const SUPPRESS_NATIVE_PASTE_MS = 100;
 // handshake arrives. The clear only wipes pixels; modes stay up.
 const CLEAR_SEQUENCE = "\x1b[3J\x1b[2J\x1b[H";
 
+// Erase only the row the cursor is on (2K = Erase Line, entire line) and
+// return to its start (\r) — used by Cut, which targets the in-progress
+// command line, not the whole pane. Never touches scrollback/other rows, so
+// unlike CLEAR_SEQUENCE it can't strand the viewport past a shrunk buffer —
+// no scrollToBottom() dance needed here.
+const CLEAR_CURRENT_LINE_SEQUENCE = "\x1b[2K\r";
+
 function preparePastedText(text: string): string {
 	return text.replace(/\r?\n/g, "\r");
 }
@@ -321,9 +328,28 @@ export function XtermTerminal(props: XtermTerminalProps) {
 		// (just-shrunk) buffer: the screen renders blank until something scrolls and
 		// clamps the viewport back into range. Scroll to bottom every time so the
 		// erase is visually immediate regardless of where the user was reading.
+		//
+		// write() parses asynchronously (chunked via rAF internally) — calling
+		// scrollToBottom() right after the call, rather than in write()'s completion
+		// callback, races ahead of the actual erase and runs against the stale
+		// pre-clear buffer, reproducing the exact same blank-until-scroll glitch.
+		//
+		// scrollToBottom() can itself throw ("Cannot read properties of undefined
+		// (reading 'dimensions')" out of xterm's Viewport.syncScrollArea) — the same
+		// zero-sized/not-yet-ready renderer race the mount effect above already works
+		// around, just hit here from a live erase instead of an initial write. Left
+		// uncaught, that exception aborts xterm's own internal viewport sync
+		// mid-flight, so the erase never visually lands until an unrelated scroll
+		// forces a resync. Swallow it the same way fitTerminal below does.
 		const clearTerminal = () => {
-			term.write(CLEAR_SEQUENCE);
-			term.scrollToBottom();
+			term.write(CLEAR_SEQUENCE, () => {
+				try {
+					term.scrollToBottom();
+				} catch {
+					// Renderer transiently unready right after a big erase; a later
+					// scroll or resize naturally resyncs the viewport.
+				}
+			});
 		};
 
 		let lastCopiedSelection = "";
@@ -379,7 +405,7 @@ export function XtermTerminal(props: XtermTerminalProps) {
 		actionsRef.current = {
 			cut: () => {
 				copySelection();
-				clearTerminal();
+				term.write(CLEAR_CURRENT_LINE_SEQUENCE);
 			},
 			copy: () => copySelection(),
 			paste: pasteFromClipboard,
