@@ -19,7 +19,7 @@
 //    itself only fires onResize when the grid actually changed, so repeated
 //    fits don't spam the PTY.
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { CanvasAddon } from "@xterm/addon-canvas";
 import { FitAddon } from "@xterm/addon-fit";
@@ -32,6 +32,7 @@ import { aoBridge } from "../lib/bridge";
 import { TERMINAL_FONT_SIZE_DEFAULT } from "../lib/design-tokens";
 import { buildTerminalThemes } from "../lib/terminal-themes";
 import type { Theme } from "../stores/ui-store";
+import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger } from "./ui/context-menu";
 
 export type XtermTerminalProps = {
 	ariaLabel?: string;
@@ -203,10 +204,23 @@ function forceSelectionMode(term: Terminal): void {
 	element.classList.remove("enable-mouse-events");
 }
 
+type TerminalContextMenuActions = {
+	cut: () => void;
+	copy: () => void;
+	paste: () => void;
+	selectAll: () => void;
+	clear: () => void;
+};
+
 export function XtermTerminal(props: XtermTerminalProps) {
 	const hostRef = useRef<HTMLDivElement | null>(null);
 	const termRef = useRef<Terminal | null>(null);
 	const fitRef = useRef<(() => void) | null>(null);
+	// Populated once at mount by the terminal's own copy/paste/clear closures;
+	// the context menu (rendered from this component's JSX, outside the mount
+	// effect) calls through this ref instead of duplicating that logic.
+	const actionsRef = useRef<TerminalContextMenuActions | null>(null);
+	const [hasSelection, setHasSelection] = useState(false);
 	// Latest callbacks in a ref so the mount effect stays dependency-free — we
 	// never tear down and recreate the terminal because a handler identity
 	// changed between renders.
@@ -301,6 +315,17 @@ export function XtermTerminal(props: XtermTerminalProps) {
 		term.options.macOptionClickForcesSelection = true;
 		forceSelectionMode(term);
 
+		// Erasing scrollback/screen only touches buffer content — it never moves the
+		// viewport. A pane read while scrolled up (viewportY behind the live cursor)
+		// stays parked at that same offset after the erase, which now points past the
+		// (just-shrunk) buffer: the screen renders blank until something scrolls and
+		// clamps the viewport back into range. Scroll to bottom every time so the
+		// erase is visually immediate regardless of where the user was reading.
+		const clearTerminal = () => {
+			term.write(CLEAR_SEQUENCE);
+			term.scrollToBottom();
+		};
+
 		let lastCopiedSelection = "";
 		const copySelection = (options?: { clipboardData?: DataTransfer | null; dedupe?: boolean }) => {
 			const selection = term.getSelection();
@@ -350,6 +375,16 @@ export function XtermTerminal(props: XtermTerminalProps) {
 				.catch((error) => {
 					console.warn("Unable to paste terminal clipboard text", error);
 				});
+		};
+		actionsRef.current = {
+			cut: () => {
+				copySelection();
+				clearTerminal();
+			},
+			copy: () => copySelection(),
+			paste: pasteFromClipboard,
+			selectAll: () => term.selectAll(),
+			clear: clearTerminal,
 		};
 		term.attachCustomKeyEventHandler((event) => {
 			// xterm invokes this same handler on keydown, keyup, AND keypress (see
@@ -603,7 +638,7 @@ export function XtermTerminal(props: XtermTerminalProps) {
 			},
 			write: (data) => term.write(data),
 			writeln: (line) => term.writeln(line),
-			clear: () => term.write(CLEAR_SEQUENCE),
+			clear: clearTerminal,
 			onUserInput: (listener) => {
 				userInputListeners.add(listener);
 				return { dispose: () => userInputListeners.delete(listener) };
@@ -615,6 +650,7 @@ export function XtermTerminal(props: XtermTerminalProps) {
 		return () => {
 			termRef.current = null;
 			fitRef.current = null;
+			actionsRef.current = null;
 			cancelAnimationFrame(raf);
 			for (const timer of settleTimers) window.clearTimeout(timer);
 			observer.disconnect();
@@ -640,11 +676,27 @@ export function XtermTerminal(props: XtermTerminalProps) {
 	}, []);
 
 	return (
-		<div
-			ref={hostRef}
-			aria-label={props.ariaLabel}
-			className={props.className}
-			style={{ height: "100%", overflow: "hidden", width: "100%" }}
-		/>
+		<ContextMenu onOpenChange={(open) => open && setHasSelection(termRef.current?.hasSelection() ?? false)}>
+			<ContextMenuTrigger asChild>
+				<div
+					ref={hostRef}
+					aria-label={props.ariaLabel}
+					className={props.className}
+					style={{ height: "100%", overflow: "hidden", width: "100%" }}
+				/>
+			</ContextMenuTrigger>
+			<ContextMenuContent>
+				<ContextMenuItem disabled={!hasSelection} onSelect={() => actionsRef.current?.cut()}>
+					Cut
+				</ContextMenuItem>
+				<ContextMenuItem disabled={!hasSelection} onSelect={() => actionsRef.current?.copy()}>
+					Copy
+				</ContextMenuItem>
+				<ContextMenuItem onSelect={() => actionsRef.current?.paste()}>Paste</ContextMenuItem>
+				<ContextMenuItem onSelect={() => actionsRef.current?.selectAll()}>Select All</ContextMenuItem>
+				<ContextMenuSeparator />
+				<ContextMenuItem onSelect={() => actionsRef.current?.clear()}>Clear</ContextMenuItem>
+			</ContextMenuContent>
+		</ContextMenu>
 	);
 }
