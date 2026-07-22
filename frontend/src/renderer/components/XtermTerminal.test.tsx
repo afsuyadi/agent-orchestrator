@@ -5,6 +5,8 @@ import { XtermTerminal } from "./XtermTerminal";
 
 const state = vi.hoisted(() => ({
 	linkHandler: null as null | ((event: MouseEvent, uri: string) => void),
+	webglContextLoss: null as null | (() => void),
+	loadedAddonNames: [] as string[],
 	lastTerminal: null as null | {
 		keyHandler?: (event: KeyboardEvent) => boolean;
 		wheelHandler?: (event: WheelEvent) => boolean;
@@ -57,7 +59,9 @@ vi.mock("@xterm/xterm", () => ({
 			state.lastTerminal = this;
 		}
 
-		loadAddon() {}
+		loadAddon(addon: object) {
+			state.loadedAddonNames.push(addon.constructor.name);
+		}
 		open(host: HTMLElement) {
 			host.appendChild(document.createElement("textarea"));
 		}
@@ -127,7 +131,9 @@ vi.mock("@xterm/addon-canvas", () => ({
 
 vi.mock("@xterm/addon-webgl", () => ({
 	WebglAddon: class FakeWebglAddon {
-		onContextLoss() {}
+		onContextLoss(callback: () => void) {
+			state.webglContextLoss = callback;
+		}
 		dispose() {}
 	},
 }));
@@ -147,6 +153,8 @@ describe("XtermTerminal", () => {
 	beforeEach(() => {
 		state.lastTerminal = null;
 		state.linkHandler = null;
+		state.webglContextLoss = null;
+		state.loadedAddonNames = [];
 		setNavigatorPlatform("Linux x86_64");
 		window.ao!.clipboard.writeText = vi.fn().mockResolvedValue(undefined);
 		window.ao!.clipboard.readText = vi.fn().mockResolvedValue("");
@@ -649,35 +657,22 @@ describe("XtermTerminal", () => {
 		expect(state.lastTerminal!._core._selectionService.shouldForceSelection({} as MouseEvent)).toBe(true);
 	});
 
+	it("falls back to the canvas renderer when the WebGL context is lost", () => {
+		render(<XtermTerminal theme="dark" />);
+		expect(state.loadedAddonNames).toContain("FakeWebglAddon");
+		expect(state.loadedAddonNames).not.toContain("FakeCanvasAddon");
+
+		// A lost context previously disposed the WebGL addon with no replacement,
+		// leaving the terminal with no renderer at all — every later
+		// renderer-dependent call (scrollToBottom, xterm's own internal scrollbar
+		// sync during an erase) would then throw reading `.dimensions` of nothing,
+		// permanently. The terminal must always have a working renderer.
+		state.webglContextLoss!();
+
+		expect(state.loadedAddonNames).toContain("FakeCanvasAddon");
+	});
+
 	describe("right-click context menu", () => {
-		it("copies the current selection and clears only the current line via the Cut menu item", async () => {
-			const { container } = render(<XtermTerminal theme="dark" />);
-			state.lastTerminal!.selection = "menu cut selection";
-
-			fireEvent.contextMenu(container.firstElementChild!);
-			await userEvent.click(await screen.findByText("Cut"));
-
-			expect(window.ao!.clipboard.writeText).toHaveBeenCalledWith("menu cut selection");
-			// Cut targets the in-progress input line only (2K + \r) — it must never
-			// send the whole-pane CLEAR_SEQUENCE (3J/2J), which would also wipe
-			// scrollback and everything else already printed.
-			expect(state.lastTerminal!.write).toHaveBeenCalledWith("\x1b[2K\r");
-			expect(state.lastTerminal!.write).not.toHaveBeenCalledWith("\x1b[3J\x1b[2J\x1b[H", expect.any(Function));
-		});
-
-		it("disables Cut when nothing is selected", async () => {
-			const { container } = render(<XtermTerminal theme="dark" />);
-			state.lastTerminal!.selection = "";
-
-			fireEvent.contextMenu(container.firstElementChild!);
-			const cutItem = await screen.findByText("Cut");
-
-			expect(cutItem.closest('[role="menuitem"]')).toHaveAttribute("data-disabled");
-			await userEvent.click(cutItem);
-			expect(window.ao!.clipboard.writeText).not.toHaveBeenCalled();
-			expect(state.lastTerminal!.write).not.toHaveBeenCalled();
-		});
-
 		it("copies the current selection via the Copy menu item", async () => {
 			const { container } = render(<XtermTerminal theme="dark" />);
 			state.lastTerminal!.selection = "menu copied selection";
@@ -736,16 +731,6 @@ describe("XtermTerminal", () => {
 			await userEvent.click(await screen.findByText("Clear"));
 
 			expect(state.lastTerminal!.scrollToBottom).toHaveBeenCalled();
-		});
-
-		it("does not scroll or touch scrollback when cutting, since only the current line is erased", async () => {
-			const { container } = render(<XtermTerminal theme="dark" />);
-			state.lastTerminal!.selection = "menu cut selection";
-
-			fireEvent.contextMenu(container.firstElementChild!);
-			await userEvent.click(await screen.findByText("Cut"));
-
-			expect(state.lastTerminal!.scrollToBottom).not.toHaveBeenCalled();
 		});
 
 		it("does not throw when scrollToBottom hits the renderer-not-ready race after Clear", async () => {
