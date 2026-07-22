@@ -57,23 +57,42 @@ export type XtermTerminalProps = {
 	onReady?: (terminal: AttachableTerminal) => void;
 };
 
-// Prefer the WebGL renderer, fall back to 2D canvas. Both rasterize box-drawing
-// glyphs themselves onto a fixed cell grid; the DOM renderer does not, so TUI
-// borders would drift. Loaded after open().
-function loadRenderer(term: Terminal): void {
-	try {
-		const webgl = new WebglAddon();
-		webgl.onContextLoss(() => webgl.dispose());
-		term.loadAddon(webgl);
-		return;
-	} catch {
-		// WebGL context unavailable — fall through to the canvas renderer.
-	}
+function loadCanvasRenderer(term: Terminal): void {
 	try {
 		term.loadAddon(new CanvasAddon());
 	} catch (error) {
 		console.warn("xterm: WebGL and canvas renderers unavailable; box-drawing may drift", error);
 	}
+}
+
+// Prefer the WebGL renderer, fall back to 2D canvas. Both rasterize box-drawing
+// glyphs themselves onto a fixed cell grid; the DOM renderer does not, so TUI
+// borders would drift. Loaded after open().
+//
+// A lost WebGL context (a real occurrence under GPU/driver pressure — e.g. a
+// large erase like Clear repainting the whole grid at once) previously just
+// disposed the WebGL addon with no replacement, leaving the terminal with NO
+// renderer at all from that point on. Every subsequent renderer-dependent call
+// — including xterm's own internal scrollbar sync that runs automatically
+// while processing an erase, not just our explicit scrollToBottom() — then
+// throws reading `.dimensions` of a nonexistent renderer, permanently (not
+// transiently), which is what made the erase look stuck/frozen until an
+// unrelated interaction forced some other code path to repaint. Load the
+// canvas fallback on context loss so the terminal always has a working
+// renderer to resync against.
+function loadRenderer(term: Terminal): void {
+	try {
+		const webgl = new WebglAddon();
+		webgl.onContextLoss(() => {
+			webgl.dispose();
+			loadCanvasRenderer(term);
+		});
+		term.loadAddon(webgl);
+		return;
+	} catch {
+		// WebGL context unavailable — fall through to the canvas renderer.
+	}
+	loadCanvasRenderer(term);
 }
 
 // xterm palette tracks the app theme (see lib/terminal-themes.ts + tokens.css).
@@ -84,13 +103,6 @@ const SUPPRESS_NATIVE_PASTE_MS = 100;
 // re-asserts terminal modes anyway, but a full RIS would drop them until that
 // handshake arrives. The clear only wipes pixels; modes stay up.
 const CLEAR_SEQUENCE = "\x1b[3J\x1b[2J\x1b[H";
-
-// Erase only the row the cursor is on (2K = Erase Line, entire line) and
-// return to its start (\r) — used by Cut, which targets the in-progress
-// command line, not the whole pane. Never touches scrollback/other rows, so
-// unlike CLEAR_SEQUENCE it can't strand the viewport past a shrunk buffer —
-// no scrollToBottom() dance needed here.
-const CLEAR_CURRENT_LINE_SEQUENCE = "\x1b[2K\r";
 
 function preparePastedText(text: string): string {
 	return text.replace(/\r?\n/g, "\r");
@@ -212,7 +224,6 @@ function forceSelectionMode(term: Terminal): void {
 }
 
 type TerminalContextMenuActions = {
-	cut: () => void;
 	copy: () => void;
 	paste: () => void;
 	selectAll: () => void;
@@ -403,10 +414,6 @@ export function XtermTerminal(props: XtermTerminalProps) {
 				});
 		};
 		actionsRef.current = {
-			cut: () => {
-				copySelection();
-				term.write(CLEAR_CURRENT_LINE_SEQUENCE);
-			},
 			copy: () => copySelection(),
 			paste: pasteFromClipboard,
 			selectAll: () => term.selectAll(),
@@ -712,9 +719,6 @@ export function XtermTerminal(props: XtermTerminalProps) {
 				/>
 			</ContextMenuTrigger>
 			<ContextMenuContent>
-				<ContextMenuItem disabled={!hasSelection} onSelect={() => actionsRef.current?.cut()}>
-					Cut
-				</ContextMenuItem>
 				<ContextMenuItem disabled={!hasSelection} onSelect={() => actionsRef.current?.copy()}>
 					Copy
 				</ContextMenuItem>
